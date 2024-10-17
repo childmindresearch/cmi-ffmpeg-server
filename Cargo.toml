@@ -1,0 +1,14 @@
+[package]
+name = "handler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7.5", features = ["multipart"] }
+axum_typed_multipart = "0.12.1"
+bytes = "1.7.2"
+serde = { version = "1.0.210", features = ["derive"] }
+tempfile = "3.12.0"
+tokio = { version = "1.40.0", features = ["rt", "macros", "rt-multi-thread", "fs"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
