@@ -10,9 +10,11 @@ use axum::{
     response::IntoResponse,
 };
 use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use tar::Builder;
 use tempfile::NamedTempFile;
 use tracing::{error, info};
-use zip::write::FileOptions;
 
 pub(crate) fn init_router() -> axum::Router {
     axum::Router::new()
@@ -52,7 +54,12 @@ async fn post_ffmpeg(
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }?;
 
-    match zip(files) {
+    let tar_file = match tar(files) {
+        Ok(value) => Ok(value),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }?;
+
+    match gzip(tar_file) {
         Ok(value) => Ok(value),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -113,26 +120,29 @@ fn run_ffmpeg(
     return Ok(outputs);
 }
 
-fn zip(files: Vec<NamedTempFile>) -> zip::result::ZipResult<Vec<u8>> {
-    let mut buffer = Cursor::new(Vec::new());
-    let mut zip_writer = zip::ZipWriter::new(&mut buffer);
-    let options: FileOptions<'_, ()> =
-        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
-
-    for temp_file in files {
-        let file_name = temp_file
-            .path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("tempfile")
-            .to_owned();
-
-        zip_writer.start_file(file_name, options)?;
-        let mut file = File::open(temp_file.path())?;
-        io::copy(&mut file, &mut zip_writer)?;
+fn tar(files: Vec<NamedTempFile>) -> io::Result<NamedTempFile> {
+    let mut tarball = NamedTempFile::new()?;
+    {
+        let mut tar_builder = Builder::new(&mut tarball);
+        for file in files {
+            let path = file.path();
+            let filename = path.file_name().unwrap();
+            let mut f = File::open(path)?;
+            tar_builder.append_file(filename, &mut f)?;
+        }
+        tar_builder.finish()?;
     }
 
-    zip_writer.finish()?;
+    Ok(tarball)
+}
+
+fn gzip(file: NamedTempFile) -> io::Result<Vec<u8>> {
+    let mut buffer = Cursor::new(Vec::new());
+    let mut encoder = GzEncoder::new(&mut buffer, Compression::default());
+
+    io::copy(&mut File::open(file.path())?, &mut encoder)?;
+
+    encoder.finish()?;
     Ok(buffer.into_inner())
 }
 
