@@ -1,4 +1,6 @@
+use std::fs::File;
 use std::io::prelude::Read;
+use std::io::{self, Cursor};
 use std::process::Command;
 
 use axum::routing;
@@ -10,6 +12,7 @@ use axum::{
 use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
 use tempfile::NamedTempFile;
 use tracing::{error, info};
+use zip::write::FileOptions;
 
 pub(crate) fn init_router() -> axum::Router {
     axum::Router::new()
@@ -22,12 +25,14 @@ struct UploadFileRequest {
     #[form_data(limit = "unlimited")]
     file: FieldData<NamedTempFile>,
     to: String,
+    max_file_size: Option<usize>,
 }
 
 async fn post_ffmpeg(
     TypedMultipart(UploadFileRequest {
         mut file,
         to: output_format,
+        max_file_size,
     }): TypedMultipart<UploadFileRequest>,
 ) -> Result<impl IntoResponse, http::StatusCode> {
     info!("Entering POST pandoc endpoint.");
@@ -42,48 +47,138 @@ async fn post_ffmpeg(
         http::StatusCode::BAD_REQUEST
     })?;
 
-    match run_ffmpeg(file_contents, file_extension, &output_format) {
+    let files = match run_ffmpeg(file_contents, file_extension, &output_format, max_file_size) {
+        Ok(value) => Ok(value),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }?;
+
+    match zip(files) {
         Ok(value) => Ok(value),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
-fn run_ffmpeg(file: bytes::Bytes, from: &str, to: &str) -> Result<Vec<u8>, std::io::Error> {
+fn run_ffmpeg(
+    file: bytes::Bytes,
+    from: &str,
+    to: &str,
+    max_file_size: Option<usize>,
+) -> Result<Vec<NamedTempFile>, Box<dyn std::error::Error>> {
     let input_file = tempfile::Builder::new()
         .suffix(&format!(".{}", from))
         .tempfile()?;
 
-    let output_file = tempfile::Builder::new()
-        .suffix(&format!(".{}", to))
-        .tempfile()?;
-
     std::fs::write(input_file.path(), file)?;
 
-    let status = Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i")
-        .arg(input_file.path())
-        .arg("-f")
-        .arg(to)
-        .arg(output_file.path())
-        .status()?;
+    let duration = get_duration(&input_file)?;
+    let mut current_duration = 0.0;
+    let mut counter = 0;
 
-    if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "FFmpeg conversion failed",
-        ));
+    let mut outputs: Vec<NamedTempFile> = Vec::new();
+    while current_duration < duration {
+        outputs.push(
+            tempfile::Builder::new()
+                .prefix(&format!("{:08}_", counter))
+                .suffix(&format!(".{}", to))
+                .tempfile()?,
+        );
+
+        let status = Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-i")
+            .arg(input_file.path())
+            .arg("-ss")
+            .arg(current_duration.to_string())
+            .args(
+                max_file_size
+                    .map(|size| vec!["-fs".to_string(), size.to_string()])
+                    .unwrap_or_else(Vec::new),
+            )
+            .arg("-f")
+            .arg(to)
+            .arg(outputs.last().unwrap().path())
+            .status()?;
+
+        if !status.success() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "FFmpeg conversion failed",
+            )));
+        }
+
+        counter += 1;
+        current_duration += get_duration(outputs.last().unwrap())?;
     }
 
-    let mut output_bytes = Vec::new();
-    let mut file_reader = std::fs::File::open(output_file.path())?;
-    file_reader.read_to_end(&mut output_bytes)?;
+    return Ok(outputs);
+}
 
-    return Ok(output_bytes);
+fn zip(files: Vec<NamedTempFile>) -> zip::result::ZipResult<Vec<u8>> {
+    let mut buffer = Cursor::new(Vec::new());
+    let mut zip_writer = zip::ZipWriter::new(&mut buffer);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+    for temp_file in files {
+        let file_name = temp_file
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("tempfile")
+            .to_owned();
+
+        zip_writer.start_file(file_name, options)?;
+        let mut file = File::open(temp_file.path())?;
+        io::copy(&mut file, &mut zip_writer)?;
+    }
+
+    zip_writer.finish()?;
+    Ok(buffer.into_inner())
 }
 
 fn convert_file_to_bytes(file: &mut NamedTempFile) -> std::io::Result<bytes::Bytes> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
     Ok(bytes::Bytes::from(buffer))
+}
+
+fn get_duration(file: &NamedTempFile) -> Result<f64, Box<dyn std::error::Error>> {
+    let input_file_str = file.path().to_str().ok_or_else(|| {
+        error!("Could not find file path for temp file.");
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to get tempfile filepath.",
+        )
+    })?;
+
+    let output = Command::new("ffprobe")
+        .arg("-i")
+        .arg(input_file_str)
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-v")
+        .arg("quiet")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .output()
+        .map_err(|e| format!("Failed to execute ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        return Err("ffprobe command failed".into());
+    }
+
+    let output_str = std::str::from_utf8(&output.stdout)
+        .map_err(|e| format!("Invalid UTF-8 output from ffprobe: {}", e))?;
+
+    let duration_str = output_str
+        .split('.')
+        .next()
+        .ok_or_else(|| "Failed to parse duration".to_string())?;
+
+    let duration: f64 = duration_str
+        .trim()
+        .parse()
+        .map_err(|e| format!("Failed to convert duration to float: {}", e))?;
+
+    Ok(duration)
 }
